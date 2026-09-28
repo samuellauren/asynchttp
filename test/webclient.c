@@ -24,6 +24,7 @@ typedef struct {
     bool json;
     const char *proxy;
     long timeout;
+    long count;
     const char *trace_include;
     const char *trace_exclude;
     int64_t spam;
@@ -49,6 +50,19 @@ static void get_next(globals_t *g);
 static void close_and_exit(globals_t *g)
 {
     async_quit_loop(g->async);
+}
+
+/* Schedule the next request if --spam was given and --count has not
+ * been exhausted. Otherwise, quit. */
+static void request_finished(globals_t *g)
+{
+    if (g->args->count > 0)
+        g->args->count--;
+    if (g->success && g->args->spam >= 0 && g->args->count != 0)
+        async_timer_start(g->async, async_now(g->async) + g->args->spam,
+                          (action_1) { g, (act_1) get_next });
+    else
+        close_and_exit(g);
 }
 
 static void probe_receive(globals_t *g)
@@ -82,11 +96,7 @@ static void probe_receive(globals_t *g)
         fprintf(stderr, "Done (with an error response)!\n");
     http_op_jockey_close(g->jockey);
     g->jockey = NULL;
-    if (g->success && g->args->spam >= 0)
-        async_timer_start(g->async, async_now(g->async) + g->args->spam,
-                          (action_1) { g, (act_1) get_next });
-    else
-        close_and_exit(g);
+    request_finished(g);
 }
 
 static void get_next_raw(globals_t *g)
@@ -116,11 +126,7 @@ static void probe_json_receive(globals_t *g)
     }
     jsonop_close(g->json_request);
     g->json_request = NULL;
-    if (g->success && g->args->spam >= 0)
-        async_timer_start(g->async, async_now(g->async) + g->args->spam,
-                          (action_1) { g, (act_1) get_next });
-    else
-        close_and_exit(g);
+    request_finished(g);
 }
 
 static void get_next_json(globals_t *g)
@@ -194,6 +200,7 @@ static void print_usage(FILE *f)
     fprintf(f, "    --trace-include <regex>\n");
     fprintf(f, "    --trace-exclude <regex>\n");
     fprintf(f, "    --spam <interval>\n");
+    fprintf(f, "    --count <requests>\n");
     fprintf(f, "    --unverified\n");
     fprintf(f, "    --pinned\n");
     fprintf(f, "    -h,--help\n");
@@ -249,6 +256,16 @@ static int parse_cmdline(int argc, const char *const argv[], args_t *args)
             args->spam = (int64_t)(interval * ASYNC_S);
             continue;
         }
+        if (!strcmp(argv[i], "--count")) {
+            if (++i >= argc)
+                bad_usage();
+            const char *start = argv[i++];
+            char *end;
+            args->count = strtol(start, &end, 10);
+            if (start == end || args->count <= 0)
+                bad_usage();
+            continue;
+        }
         if (!strcmp(argv[i], "--unverified")) {
             i++;
             args->unverified = true;
@@ -277,6 +294,7 @@ int main(int argc, const char *const *argv)
     args_t args = {
         .spam = -1,
         .timeout = -1,
+        .count = -1,
     };
     int i = parse_cmdline(argc, argv, &args);
     if (!args.proxy)

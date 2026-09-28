@@ -714,7 +714,8 @@ static bool reuse_connection(http_op_t *op, const char *host, unsigned port,
             FSTRACE(ASYNCHTTP_OP_REUSE, op->uid, host, port,
                     https ? "HTTPS" : "HTTP", pe->uid);
             op->stack = peel_pool_element(pe);
-            http_register_callback(op->stack.http_conn, op->callback);
+            action_1 probe_cb = { op, (act_1) op_probe };
+            http_register_callback(op->stack.http_conn, probe_cb);
             return true;
         }
     }
@@ -974,6 +975,43 @@ static void pool_elem_timeout(pool_elem_t *pe)
     close_stack(peel_pool_element(pe));
 }
 
+static void discard_pool_element(pool_elem_t *pe)
+{
+    async_timer_cancel(pe->client->async, pe->timer);
+    close_stack(peel_pool_element(pe));
+}
+
+FSTRACE_DECL(ASYNCHTTP_POOL_PROBE, "UID=%64u");
+FSTRACE_DECL(ASYNCHTTP_POOL_PROBE_IDLE, "UID=%64u");
+FSTRACE_DECL(ASYNCHTTP_POOL_PROBE_UNSOLICITED, "UID=%64u");
+FSTRACE_DECL(ASYNCHTTP_POOL_PROBE_DISCONNECTED, "UID=%64u ERRNO=%e");
+
+/* Read from an idle, pooled connection. The operation that used the
+ * connection is gone, so nobody else is going to read it. Reading
+ * drains whatever the decoder still needs to skip from the previous
+ * response and, once EAGAIN is reached, arms the connection so that
+ * the next input notification is delivered here. If the server has
+ * closed the connection or sent garbage or an unsolicited response,
+ * the connection cannot be reused. */
+static void pool_elem_probe(pool_elem_t *pe)
+{
+    FSTRACE(ASYNCHTTP_POOL_PROBE, pe->uid);
+    errno = 0;
+    const http_env_t *envelope =
+        http_receive(pe->stack.http_conn, HTTP_ENV_RESPONSE);
+    if (envelope) {
+        FSTRACE(ASYNCHTTP_POOL_PROBE_UNSOLICITED, pe->uid);
+        discard_pool_element(pe);
+        return;
+    }
+    if (errno == EAGAIN) {
+        FSTRACE(ASYNCHTTP_POOL_PROBE_IDLE, pe->uid);
+        return;
+    }
+    FSTRACE(ASYNCHTTP_POOL_PROBE_DISCONNECTED, pe->uid);
+    discard_pool_element(pe);
+}
+
 FSTRACE_DECL(ASYNCHTTP_MOVE_TO_POOL, "UID=%64u OP=%64u CLIENT=%64u");
 
 static void move_connection_to_pool(http_op_t *op)
@@ -994,6 +1032,15 @@ static void move_connection_to_pool(http_op_t *op)
         async_now(client->async) + STALE_CONNECTION_TIMEOUT * ASYNC_S;
     pe->timer = async_timer_start(client->async, expiry, pe_cb);
     pe->loc = list_append(client->free_conn_pool, pe);
+    /* The connection's decoder still notifies the operation's probe.
+     * The operation is about to be freed, so redirect the notifications
+     * to the pool element for as long as the connection is idle. Probe
+     * right away: the connection is only notified of input after it
+     * has been read until EAGAIN, and the server may already have
+     * closed it. */
+    action_1 probe_cb = { pe, (act_1) pool_elem_probe };
+    http_register_callback(pe->stack.http_conn, probe_cb);
+    pool_elem_probe(pe);
 }
 
 FSTRACE_DECL(ASYNCHTTP_OP_RESPONSE_CLOSED, "UID=%64u");
